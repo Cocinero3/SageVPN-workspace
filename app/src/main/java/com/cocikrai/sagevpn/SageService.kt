@@ -1,10 +1,15 @@
-package com.example.sagevpn
+package com.cocikrai.sagevpn
 
 import android.content.Intent
 import android.net.VpnService
+import android.os.ParcelFileDescriptor
 import android.util.Log
+import java.io.FileInputStream
+import java.nio.ByteBuffer
 
-class SageService:VpnService() {
+
+
+class SageService : VpnService() {
 
     private var mThread: Thread? = null
     private var mInterface: ParcelFileDescriptor? = null
@@ -43,13 +48,20 @@ class SageService:VpnService() {
                 .establish()
 
             val inputStream = FileInputStream(mInterface?.fileDescriptor)
-            val buffer = ByteArray(32767)
+            val buffer: ByteBuffer = ByteBuffer.allocate(32767)
             // VPN processing loop
             while (true) {
-                val length = inputStream.read(buffer)
+                val length = inputStream.read(buffer.array())
                 if(length > 0) {
-                    val packetInfo = buffer.take(10).joinToString(":") { "%02x".format(it) }
-                    Log.d("VPN", "Received packet: $packetInfo")
+                    Log.i("SAGEVPN","************new packet");
+                    while (buffer.hasRemaining()) {
+                        Log.i("SAGEVPN",""+buffer.get());
+                        //System.out.print((char) packet.get());
+                    }
+
+                    buffer.clear();
+                    //val packetInfo = buffer.take(50).joinToString(":") { "%02s".format(it) }
+                    //Log.d("VPN", "Received packet: $packetInfo")
                 }
 
             }

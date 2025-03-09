@@ -1,4 +1,4 @@
-package com.example.sagevpn
+package com.cocikrai.sagevpn
 
 import org.junit.Test
 
