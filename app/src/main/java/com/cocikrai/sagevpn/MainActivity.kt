@@ -14,6 +14,7 @@ import androidx.core.view.WindowInsetsCompat
 class MainActivity : AppCompatActivity() {
 
     private lateinit var btStartVPN:Button
+    private lateinit var btStopVPN:Button
 
     @SuppressLint("UnsafeIntentLaunch")
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -22,6 +23,7 @@ class MainActivity : AppCompatActivity() {
         setContentView(R.layout.activity_main)
 
         btStartVPN = findViewById(R.id.btStart)
+        btStopVPN = findViewById(R.id.btStop)
 
         btStartVPN.setOnClickListener{
             intent = VpnService.prepare(this)
@@ -32,6 +34,11 @@ class MainActivity : AppCompatActivity() {
             } else {
                 onActivityResult(0, RESULT_OK, null)
             }
+        }
+
+        btStopVPN.setOnClickListener{
+            Log.d("SAGEVPN", "Stopping SageVPN service")
+            stopService(getServiceIntent())
         }
 
         ViewCompat.setOnApplyWindowInsetsListener(findViewById(R.id.main)) { v, insets ->

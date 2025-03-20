@@ -52,17 +52,62 @@ class SageService : VpnService() {
             // VPN processing loop
             while (true) {
                 val length = inputStream.read(buffer.array())
-                if(length > 0) {
-                    Log.i("SAGEVPN","************new packet");
-                    while (buffer.hasRemaining()) {
-                        Log.i("SAGEVPN",""+buffer.get());
-                        //System.out.print((char) packet.get());
+                val stream: ByteBuffer = buffer
+
+                val versionAndHeaderLength: Byte = stream.get()
+                val ipVersion = (versionAndHeaderLength.toInt() shr 4).toByte()
+                if (ipVersion.toInt() != 0x04) {
+                    buffer.clear()
+                } else {
+                    val internetHeaderLength = (versionAndHeaderLength.toInt() and 0x0F).toByte()
+                    if (stream.capacity() < internetHeaderLength * 4) {
+                        throw Exception("Not enough space in array for IP header")
                     }
 
-                    buffer.clear();
-                    //val packetInfo = buffer.take(50).joinToString(":") { "%02s".format(it) }
-                    //Log.d("VPN", "Received packet: $packetInfo")
+                    val dscpAndEcn: Byte = stream.get()
+                    val dscp = (dscpAndEcn.toInt() shr 2).toByte()
+                    val ecn = (dscpAndEcn.toInt() and 0x03).toByte()
+                    val totalLength: Short = stream.getShort()
+                    val identification: Short = stream.getShort()
+                    val flagsAndFragmentOffset: Short = stream.getShort()
+                    val mayFragment = (flagsAndFragmentOffset.toInt() and 0x4000) != 0
+                    val lastFragment = (flagsAndFragmentOffset.toInt() and 0x2000) != 0
+                    val fragmentOffset = (flagsAndFragmentOffset.toInt() and 0x1FFF).toShort()
+                    val timeToLive: Byte = stream.get()
+                    val protocol: Byte = stream.get()
+                    val checksum: Short = stream.getShort()
+                    val sourceIPArray = ByteArray(4)
+                    sourceIPArray[0] = stream.get()
+                    sourceIPArray[1] = stream.get()
+                    sourceIPArray[2] = stream.get()
+                    sourceIPArray[3] = stream.get()
+                    //val sourceIp: Int = stream.getInt()
+                    //val desIp: Int = stream.getInt()
+                    val desIPArray = ByteArray(4)
+                    desIPArray[0] = stream.get()
+                    desIPArray[1] = stream.get()
+                    desIPArray[2] = stream.get()
+                    desIPArray[3] = stream.get()
+                    Log.i("SAGEVPN-sourceIP", sourceIPArray.joinToString(".") { "%02X".format(it) })
+                    Log.i("SAGEVPN-desIP", desIPArray.joinToString(".") { "%02X".format(it) })
+
+                    if(length > 0) {
+                        Log.i("SAGEVPN","************new packet");
+                        var runningString: String = ""
+                        while (buffer.hasRemaining()) {
+                            val bufferValue = buffer.get()
+                            runningString += String.format("%02X", bufferValue)
+                            //Log.i("SAGEVPN",""+ bufferValue.toString());
+                        }
+
+                        Log.i("SAGEVPN", runningString)
+                        buffer.clear();
+                        //val packetInfo = buffer.take(50).joinToString(":") { "%02s".format(it) }
+                        //Log.d("VPN", "Received packet: $packetInfo")
+                    }
                 }
+
+
 
             }
         } catch (e: Exception) {
