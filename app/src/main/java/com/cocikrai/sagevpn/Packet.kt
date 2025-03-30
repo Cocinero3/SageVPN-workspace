@@ -3,6 +3,10 @@ package com.cocikrai.sagevpn
 import android.util.Log
 import java.nio.ByteBuffer
 
+fun readUnsignedShort(buffer: ByteBuffer): Int {
+    return (buffer.get().toInt() and 0xFF) shl 8 or (buffer.get().toInt() and 0xFF)
+}
+
 class IPV4Headers(stream: ByteBuffer, version: Byte, ihl: Byte) {
 
     var ipVersion = version
@@ -41,8 +45,8 @@ class IPV4Headers(stream: ByteBuffer, version: Byte, ihl: Byte) {
         checksum = stream.getShort()
         stream.get(sourceIPArray)
         stream.get(desIPArray)
-        Log.i("SAGEVPN-sourceIP", sourceIPArray.joinToString(".") { "%02X".format(it) })
-        Log.i("SAGEVPN-desIP", desIPArray.joinToString(".") { "%02X".format(it) })
+        Log.i("SAGEVPN-sourceIP", sourceIPArray.joinToString(".") { "%d".format(it) })
+        Log.i("SAGEVPN-desIP", desIPArray.joinToString(".") { "%d".format(it) })
         Log.i("SAGEVPN-ip4-protocol", String.format("%02X", protocol))
     }
 }
@@ -80,6 +84,23 @@ class IPV6Headers(stream: ByteBuffer, version: Byte, extra: Byte) {
 
         Log.i("SAGEVPN-REMAINING", remaining.joinToString("") { "%02X".format(it) })
     }
+
+    fun getSourceString(): String {
+        var sourceString = ""
+        for(i in 0..14 step 2) {
+            sourceString += String.format("%02X", sourceIP[i]) + String.format("%02X", sourceIP[i+1]) + ":"
+        }
+        return sourceString.dropLast(1)
+    }
+
+    fun getDestinationString(): String {
+        var destinationString = ""
+        for(i in 0..14 step 2) {
+            destinationString += String.format("%02X", destinationIP[i]) + String.format("%02X", destinationIP[i+1]) + ":"
+        }
+
+        return destinationString.dropLast(1)
+    }
 }
 
 
@@ -92,11 +113,20 @@ class Packet(stream: ByteBuffer) {
     var ipv4Headers: IPV4Headers? = null
     var ipv6Headers: IPV6Headers? = null
 
+    var sourcePort: Int = 0
+    var destPort: Int = 0
+
     init {
         if (ipVersion.toInt() != 0x04) {
             ipv6Headers = IPV6Headers(stream, ipVersion, internetHeaderLength)
         } else {
             ipv4Headers = IPV4Headers(stream, ipVersion, internetHeaderLength)
+            sourcePort = readUnsignedShort(stream)
+            destPort = readUnsignedShort(stream)
+            Log.i("SAGEVPN-sourcePort", sourcePort.toString())
+            Log.i("SAGEVPN-destPort", destPort.toString())
+
+
         }
     }
     val backBuffer = stream
