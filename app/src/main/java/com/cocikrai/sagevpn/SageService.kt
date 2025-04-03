@@ -31,7 +31,20 @@ class SageService : VpnService() {
         return START_STICKY
     }
 
+    override fun onRevoke() {
+        Log.d("SAGE", "onRevoke has been triggered for Sage")
+        stopForeground(true)
+        mThread?.interrupt()
+        try {
+            mInterface?.close()
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
+        super.onRevoke()
+    }
+
     override fun onDestroy() {
+        stopForeground(true)
         Log.d("SAGE", "onDestroy has been triggered for Sage")
         mThread?.interrupt()
         try {
@@ -48,7 +61,7 @@ class SageService : VpnService() {
             val builder = Builder()
             mInterface = builder.setSession("MyVpnService")
                 .addAddress("10.0.0.2", 32)
-                .addDnsServer("8.8.8.8")
+                //.addDnsServer("8.8.8.8")
                 .addRoute("0.0.0.0", 0)
                 .establish()
 

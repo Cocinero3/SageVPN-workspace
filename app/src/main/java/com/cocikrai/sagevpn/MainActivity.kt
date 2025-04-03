@@ -14,6 +14,7 @@ import androidx.appcompat.app.AppCompatActivity
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.lifecycle.LiveData
+import kotlin.experimental.and
 
 class MainActivity : AppCompatActivity() {
 
@@ -45,8 +46,8 @@ class MainActivity : AppCompatActivity() {
             col2.setPadding(3,3,3,3)
             col2.gravity = 5
             if(newPacket.ipv4Headers != null) {
-                col1.text = newPacket.ipv4Headers!!.sourceIPArray.joinToString(".") { "%d".format(it) }
-                col2.text = newPacket.ipv4Headers!!.desIPArray.joinToString(".") { "%d".format(it) }
+                col1.text = newPacket.ipv4Headers!!.sourceIPArray.joinToString(".") { "%d".format(it.toInt() and 0xFF) }
+                col2.text = newPacket.ipv4Headers!!.desIPArray.joinToString(".") { "%d".format(it.toInt() and 0xFF) }
             } else {
                 col1.text = newPacket.ipv6Headers!!.getSourceString()
                 col2.text = newPacket.ipv6Headers!!.getDestinationString()

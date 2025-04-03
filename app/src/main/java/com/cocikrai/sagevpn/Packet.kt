@@ -2,6 +2,7 @@ package com.cocikrai.sagevpn
 
 import android.util.Log
 import java.nio.ByteBuffer
+import kotlin.experimental.and
 
 fun readUnsignedShort(buffer: ByteBuffer): Int {
     return (buffer.get().toInt() and 0xFF) shl 8 or (buffer.get().toInt() and 0xFF)
@@ -45,8 +46,9 @@ class IPV4Headers(stream: ByteBuffer, version: Byte, ihl: Byte) {
         checksum = stream.getShort()
         stream.get(sourceIPArray)
         stream.get(desIPArray)
-        Log.i("SAGEVPN-sourceIP", sourceIPArray.joinToString(".") { "%d".format(it) })
-        Log.i("SAGEVPN-desIP", desIPArray.joinToString(".") { "%d".format(it) })
+
+        Log.i("SAGEVPN-sourceIP", sourceIPArray.joinToString(".") { "%d".format(it.toInt() and 0xFF) })
+        Log.i("SAGEVPN-desIP", desIPArray.joinToString(".") { "%d".format(it.toInt() and 0xFF) })
         Log.i("SAGEVPN-ip4-protocol", String.format("%02X", protocol))
     }
 }
