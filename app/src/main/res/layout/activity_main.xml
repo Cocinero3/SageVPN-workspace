@@ -28,10 +28,30 @@
         app:layout_constraintStart_toStartOf="parent"
         app:layout_constraintTop_toTopOf="parent" />
 
+    <EditText
+        android:id="@+id/textInput"
+        android:layout_width="560dp"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="152dp"
+        android:hint="Enter IP"
+        android:inputType="text"
+        app:layout_constraintEnd_toStartOf="@+id/blacklistButton"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintTop_toTopOf="parent" />
+
+    <Button
+        android:id="@+id/blacklistButton"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="Blacklist"
+        app:layout_constraintTop_toTopOf="@+id/textInput"
+        app:layout_constraintStart_toEndOf="@+id/textInput"
+        app:layout_constraintEnd_toEndOf="parent" />
+
     <ScrollView
-        android:layout_width="723dp"
-        android:layout_height="356dp"
-        android:layout_marginTop="148dp"
+        android:layout_width="734dp"
+        android:layout_height="301dp"
+        android:layout_marginTop="252dp"
         app:layout_constraintEnd_toEndOf="parent"
         app:layout_constraintStart_toStartOf="parent"
         app:layout_constraintTop_toTopOf="parent">

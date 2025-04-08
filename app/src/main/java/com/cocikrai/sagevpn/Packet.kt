@@ -125,12 +125,22 @@ class Packet(stream: ByteBuffer) {
             ipv4Headers = IPV4Headers(stream, ipVersion, internetHeaderLength)
             sourcePort = readUnsignedShort(stream)
             destPort = readUnsignedShort(stream)
+            if(ipv4Headers!!.protocol.toInt() == 0x06) {
+                val extra = ByteArray(16)
+                stream.get(extra)
+            } else {
+                val extra = ByteArray(4)
+                stream.get(extra)
+            }
             Log.i("SAGEVPN-sourcePort", sourcePort.toString())
             Log.i("SAGEVPN-destPort", destPort.toString())
 
 
         }
     }
-    val backBuffer = stream
+    val backBuffer = ByteArray(stream.remaining())
+    init {
+        stream.get(backBuffer)
+    }
 
 }

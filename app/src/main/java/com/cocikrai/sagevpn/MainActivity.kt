@@ -6,6 +6,7 @@ import android.net.VpnService
 import android.os.Bundle
 import android.util.Log
 import android.widget.Button
+import android.widget.EditText
 import android.widget.TableLayout
 import android.widget.TableRow
 import android.widget.TextView
@@ -21,7 +22,10 @@ class MainActivity : AppCompatActivity() {
     private lateinit var btStartVPN:Button
     private lateinit var btStopVPN:Button
     private lateinit var tableData: TableLayout
+    private lateinit var btBlacklist:Button
+    private lateinit var blacklistText: EditText
     private var packetArray: ArrayList<Packet> = ArrayList()
+    private var blacklistIps: ArrayList<String> = ArrayList()
 
     @SuppressLint("UnsafeIntentLaunch")
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -31,11 +35,14 @@ class MainActivity : AppCompatActivity() {
 
         btStartVPN = findViewById(R.id.btStart)
         btStopVPN = findViewById(R.id.btStop)
+        btBlacklist = findViewById(R.id.blacklistButton)
         tableData = findViewById(R.id.dataTable)
+        blacklistText = findViewById(R.id.textInput)
 
         val livePackets: LiveData<Packet> = SageService.packetLiveData
 
         livePackets.observe(this) { newPacket ->
+
             packetArray.add(newPacket)
             val newRow = TableRow(this)
             newRow.setId(packetArray.size)
@@ -53,10 +60,13 @@ class MainActivity : AppCompatActivity() {
                 col2.text = newPacket.ipv6Headers!!.getDestinationString()
             }
 
-            newRow.addView(col1)
-            newRow.addView(col2)
+            if(!blacklistIps.contains(col2.text.toString())) {
+                newRow.addView(col1)
+                newRow.addView(col2)
 
-            tableData.addView(newRow)
+                tableData.addView(newRow)
+            }
+
         }
 
 
@@ -73,7 +83,17 @@ class MainActivity : AppCompatActivity() {
 
         btStopVPN.setOnClickListener{
             Log.d("SAGEVPN", "Stopping SageVPN service")
-            stopService(getServiceIntent())
+            val msg = getServiceIntent()
+            msg.putExtra("block", "stop")
+            startService(msg)
+        }
+
+        btBlacklist.setOnClickListener{
+            val blockIP: String = blacklistText.text.toString()
+            blacklistIps.add(blockIP)
+            val msg = getServiceIntent()
+            msg.putExtra("block", blockIP)
+            startService(msg)
         }
 
         ViewCompat.setOnApplyWindowInsetsListener(findViewById(R.id.main)) { v, insets ->
