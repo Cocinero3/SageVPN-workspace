@@ -118,11 +118,19 @@ class Packet(stream: ByteBuffer) {
     var sourcePort: Int = 0
     var destPort: Int = 0
 
+    var srcIpString = ""
+    var destIpString = ""
+
     init {
         if (ipVersion.toInt() != 0x04) {
             ipv6Headers = IPV6Headers(stream, ipVersion, internetHeaderLength)
+            srcIpString = ipv6Headers!!.getSourceString()
+            destIpString = ipv6Headers!!.getDestinationString()
         } else {
             ipv4Headers = IPV4Headers(stream, ipVersion, internetHeaderLength)
+
+            srcIpString = ipv4Headers!!.sourceIPArray.joinToString(".") { "%d".format(it.toInt() and 0xFF) }
+            destIpString = ipv4Headers!!.desIPArray.joinToString(".") { "%d".format(it.toInt() and 0xFF) }
             sourcePort = readUnsignedShort(stream)
             destPort = readUnsignedShort(stream)
             if(ipv4Headers!!.protocol.toInt() == 0x06) {

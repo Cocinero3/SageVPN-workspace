@@ -2,11 +2,17 @@ package com.cocikrai.sagevpn
 
 import android.annotation.SuppressLint
 import android.content.Intent
+import android.graphics.Color
+import android.net.Uri
 import android.net.VpnService
 import android.os.Bundle
 import android.util.Log
+import android.view.Gravity
+import android.view.View
 import android.widget.Button
 import android.widget.EditText
+import android.widget.LinearLayout
+import android.widget.PopupWindow
 import android.widget.TableLayout
 import android.widget.TableRow
 import android.widget.TextView
@@ -63,6 +69,10 @@ class MainActivity : AppCompatActivity() {
             if(!blacklistIps.contains(col2.text.toString())) {
                 newRow.addView(col1)
                 newRow.addView(col2)
+
+                newRow.setOnClickListener{
+                    showPopup(it, newPacket)
+                }
 
                 tableData.addView(newRow)
             }
@@ -126,4 +136,67 @@ class MainActivity : AppCompatActivity() {
     private fun getServiceIntent(): Intent {
         return Intent(this, SageService::class.java)
     }
+
+    private fun showPopup(anchorView: View, packet: Packet) {
+        // Create the popup content programmatically
+        val popupContent = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setBackgroundColor(Color.WHITE)
+            setPadding(20, 20, 20, 20)
+
+            addView(TextView(this@MainActivity).apply {
+                text = "Source IP: ${packet.srcIpString}"
+                textSize = 18f
+                setTextColor(Color.BLACK)
+            })
+
+            addView(TextView(this@MainActivity).apply {
+                text = "Destination IP: ${packet.destIpString}"
+                textSize = 18f
+                setTextColor(Color.BLACK)
+            })
+
+            addView(TextView(this@MainActivity).apply {
+                text = "Source Port: ${packet.sourcePort}"
+                textSize = 18f
+                setTextColor(Color.BLACK)
+            })
+
+            addView(TextView(this@MainActivity).apply {
+                text = "Destination Port: ${packet.destPort}"
+                textSize = 18f
+                setTextColor(Color.BLACK)
+            })
+
+            val whoIsLink = "https://www.whois.com/whois/" + packet.destIpString
+            addView(TextView(this@MainActivity).apply {
+                text = "Whois Lookup"
+                textSize = 18f
+                setTextColor(Color.BLUE)
+                setOnClickListener {
+                    val intent = Intent(Intent.ACTION_VIEW, Uri.parse(whoIsLink))
+                    context.startActivity(intent)
+                }
+            })
+
+            addView(TextView(this@MainActivity).apply {
+                text = "Payload: ${packet.backBuffer.joinToString(" ") { "%02X".format(it) }}"
+                textSize = 18f
+                setTextColor(Color.BLACK)
+            })
+
+        }
+
+        // Create PopupWindow with the programmatically created view
+        val popupWindow = PopupWindow(
+            popupContent,
+            LinearLayout.LayoutParams.WRAP_CONTENT,
+            LinearLayout.LayoutParams.WRAP_CONTENT,
+            true
+        )
+
+        // Show the popup centered on the anchor view
+        popupWindow.showAtLocation(anchorView, Gravity.CENTER, 0, 0)
+    }
+
 }

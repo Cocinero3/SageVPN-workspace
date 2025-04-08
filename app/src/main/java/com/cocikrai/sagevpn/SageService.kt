@@ -100,14 +100,21 @@ class SageService : VpnService() {
             // VPN processing loop
             while (true) {
                 val length = inputStream.read(buffer.array())
-                val stream: ByteBuffer = buffer
+                if(length > 0) {
+                    val stream: ByteBuffer = buffer
+                    stream.limit(length)
+                    val data = Packet(stream)
+                    packetLiveData.postValue(data)
+                    buffer.rewind()
 
-                val data = Packet(stream)
-                packetLiveData.postValue(data)
-                buffer.rewind()
 
-                if(data.ipv4Headers != null && length > 0 && !blacklistIps.contains(data.ipv4Headers!!.desIPArray.joinToString(".") { "%d".format(it.toInt() and 0xFF) })) {
-                    try {
+
+                    if (data.ipv4Headers != null && !blacklistIps.contains(
+                            data.ipv4Headers!!.desIPArray.joinToString(
+                                "."
+                            ) { "%d".format(it.toInt() and 0xFF) })
+                    ) {
+                        try {
 //                        val socket = Socket()
 //                        socket.bind(InetSocketAddress(0))
 //                        val payload = ByteArray(buffer.remaining())
@@ -174,12 +181,12 @@ class SageService : VpnService() {
 //                        tunnel.close()
 
 
-                    } catch (e: Exception) {
-                        e.printStackTrace()
+                        } catch (e: Exception) {
+                            e.printStackTrace()
+                        }
+
                     }
-
                 }
-
               buffer.rewind()
                 if(length > 0) {
                     Log.i("SAGEVPN","************new packet");
