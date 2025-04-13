@@ -34,6 +34,80 @@ private data class TcpConnectionState(
     var windowSize: Int = 65535     // TCP window size
 )
 
+private data class ConnectionEndpoints(
+    val ip1: String,
+    val port1: Int,
+    val ip2: String,
+    val port2: Int
+) {
+    // Generate a normalized key that's the same regardless of direction
+    fun toNormalizedKey(): String {
+        // Sort the endpoints lexicographically to ensure a consistent key
+        return if (ip1 < ip2 || (ip1 == ip2 && port1 < port2)) {
+            "$ip1:$port1-$ip2:$port2"
+        } else {
+            "$ip2:$port2-$ip1:$port1"
+        }
+    }
+
+    // Get the directional key in the format "$sourceIp:$sourcePort-$destIp:$destPort"
+    fun toDirectionalKey(sourceIp: String, sourcePort: Int): String {
+        return if (sourceIp == ip1 && sourcePort == port1) {
+            "$ip1:$port1-$ip2:$port2"
+        } else {
+            "$ip2:$port2-$ip1:$port1"
+        }
+    }
+
+    // Create a companion object to parse and create ConnectionEndpoints
+    companion object {
+        fun fromConnectionKey(key: String): ConnectionEndpoints {
+            val parts = key.split("-")
+            if (parts.size != 2) throw IllegalArgumentException("Invalid connection key format: $key")
+
+            val sourceParts = parts[0].split(":")
+            val destParts = parts[1].split(":")
+
+            // Handle IPv6 addresses which contain multiple colons
+            val isSourceIpv6 = sourceParts.size > 2
+            val isDestIpv6 = destParts.size > 2
+
+            val sourceIp: String
+            val sourcePort: Int
+            val destIp: String
+            val destPort: Int
+
+            if (isSourceIpv6) {
+                // For IPv6, the last part is the port
+                sourcePort = sourceParts.last().toInt()
+                // And the address is everything else
+                sourceIp = sourceParts.dropLast(1).joinToString(":")
+            } else {
+                // Standard IPv4 handling
+                sourceIp = sourceParts[0]
+                sourcePort = sourceParts[1].toInt()
+            }
+
+            if (isDestIpv6) {
+                // For IPv6, the last part is the port
+                destPort = destParts.last().toInt()
+                // And the address is everything else
+                destIp = destParts.dropLast(1).joinToString(":")
+            } else {
+                // Standard IPv4 handling
+                destIp = destParts[0]
+                destPort = destParts[1].toInt()
+            }
+
+            return ConnectionEndpoints(sourceIp, sourcePort, destIp, destPort)
+        }
+
+        fun create(sourceIp: String, sourcePort: Int, destIp: String, destPort: Int): ConnectionEndpoints {
+            return ConnectionEndpoints(sourceIp, sourcePort, destIp, destPort)
+        }
+    }
+}
+
 class SageService : VpnService() {
     private var running = AtomicBoolean(true)
     private var vpnInterface: ParcelFileDescriptor? = null
@@ -43,8 +117,10 @@ class SageService : VpnService() {
     private var blacklistIps: ArrayList<String> = ArrayList()
     private var isStarted = false
 
-    private val tcpConnections = ConcurrentHashMap<String, SocketChannel>()
-    private val udpConnections = ConcurrentHashMap<String, DatagramChannel>()
+    private val tcpConnections = ConcurrentHashMap<String, SocketChannel>() // Key is normalized connection key
+    private val tcpConnectionDirections = ConcurrentHashMap<String, String>() // Maps normalized key to directional key
+    private val udpConnections = ConcurrentHashMap<String, DatagramChannel>() // Key is normalized connection key
+    private val udpConnectionDirections = ConcurrentHashMap<String, String>() // Maps normalized key to directional key
 
     private val selector = Selector.open()
 
@@ -56,9 +132,9 @@ class SageService : VpnService() {
         private const val BUFFER_SIZE = 32767
 
         // Debug flags
-        const val DEBUG_PACKET_DETAILS = true     // Log detailed packet info
-        const val DEBUG_FORWARDING = true         // Log packet forwarding
-        const val DEBUG_CONNECTIONS = true        // Log connection establishment
+        const val DEBUG_PACKET_DETAILS = false     // Log detailed packet info
+        const val DEBUG_FORWARDING = false         // Log packet forwarding
+        const val DEBUG_CONNECTIONS = false        // Log connection establishment
 
         private val PORT_SERVICES = mapOf(
             53 to "DNS",
@@ -119,24 +195,28 @@ class SageService : VpnService() {
             // Close all TCP connections
             for ((key, channel) in tcpConnections) {
                 try {
-                    if (DEBUG_CONNECTIONS) Log.d(TAG, "Closing TCP connection: $key")
+                    val directionKey = tcpConnectionDirections[key] ?: key
+                    if (DEBUG_CONNECTIONS) Log.d(TAG, "Closing TCP connection: $directionKey")
                     channel.close()
                 } catch (e: Exception) {
                     Log.e(TAG, "Error closing TCP connection: $key", e)
                 }
             }
             tcpConnections.clear()
+            tcpConnectionDirections.clear()
 
             // Close all UDP connections
             for ((key, channel) in udpConnections) {
                 try {
-                    if (DEBUG_CONNECTIONS) Log.d(TAG, "Closing UDP connection: $key")
+                    val directionKey = udpConnectionDirections[key] ?: key
+                    if (DEBUG_CONNECTIONS) Log.d(TAG, "Closing UDP connection: $directionKey")
                     channel.close()
                 } catch (e: Exception) {
                     Log.e(TAG, "Error closing UDP connection: $key", e)
                 }
             }
             udpConnections.clear()
+            udpConnectionDirections.clear()
 
             // Close selector
             try {
@@ -163,15 +243,11 @@ class SageService : VpnService() {
             val builder = Builder()
                 .setSession("SageVPN")
                 .addAddress("10.0.0.2", 32)
-                .addAddress("fd00:1:fd00:1:fd00:1:fd00:1", 128)  // IPv6 address
                 .addDnsServer("8.8.8.8")
                 .addDnsServer("8.8.4.4")
-                .addDnsServer("2001:4860:4860::8888")  // IPv6 DNS
                 .addRoute("0.0.0.0", 0)  // Route all IPv4 traffic
-                .addRoute("::", 0)        // Route all IPv6 traffic
                 .setMtu(BUFFER_SIZE)
                 .allowFamily(android.system.OsConstants.AF_INET)  // Allow IPv4
-                .allowFamily(android.system.OsConstants.AF_INET6) // Allow IPv6
 
             vpnInterface = builder.establish()
 
@@ -377,14 +453,16 @@ class SageService : VpnService() {
 
 
     private fun handleTcpPacket(sourceIp: String, destIp: String, sourcePort: Int, destPort: Int, data: ByteBuffer) {
-        val connectionKey = "$sourceIp:$sourcePort-$destIp:$destPort"
+        val endpoints = ConnectionEndpoints.create(sourceIp, sourcePort, destIp, destPort)
+        val normalizedKey = endpoints.toNormalizedKey()
+        val directionalKey = endpoints.toDirectionalKey(sourceIp, sourcePort)
 
         try {
-            // Get or create TCP connection
-            var channel = tcpConnections[connectionKey]
+            // Get or create TCP connection using the normalized key
+            var channel = tcpConnections[normalizedKey]
 
             if (channel == null || !channel.isConnected) {
-                if (DEBUG_CONNECTIONS) Log.d(TAG, "Creating new TCP connection: $connectionKey")
+                if (DEBUG_CONNECTIONS) Log.d(TAG, "Creating new TCP connection: $directionalKey (normalized: $normalizedKey)")
 
                 // Create new TCP connection
                 channel = SocketChannel.open()
@@ -392,10 +470,10 @@ class SageService : VpnService() {
                 // Protect this socket from VPN
                 val socketProtected = protect(channel.socket())
                 if (!socketProtected) {
-                    Log.e(TAG, "ERROR: Failed to protect TCP socket: $connectionKey")
+                    Log.e(TAG, "ERROR: Failed to protect TCP socket: $directionalKey")
                     throw IOException("Failed to protect socket from VPN loopback")
                 } else {
-                    Log.d(TAG, "TCP socket protected from VPN: $connectionKey (localPort=${channel.socket().localPort})")
+                    Log.d(TAG, "TCP socket protected from VPN: $directionalKey (localPort=${channel.socket().localPort})")
                 }
 
                 channel.configureBlocking(false)
@@ -405,16 +483,18 @@ class SageService : VpnService() {
                 channel.connect(destAddress)
 
                 // Register with selector for non-blocking I/O
-                channel.register(selector, SelectionKey.OP_CONNECT or SelectionKey.OP_READ, connectionKey)
+                channel.register(selector, SelectionKey.OP_CONNECT or SelectionKey.OP_READ, normalizedKey)
 
-                // Store the connection
-                tcpConnections[connectionKey] = channel
+                // Store the connection with normalized key
+                tcpConnections[normalizedKey] = channel
+                // Store the directional key for this connection
+                tcpConnectionDirections[normalizedKey] = directionalKey
 
-                if (DEBUG_FORWARDING) Log.d(TAG, "TCP connection pending: $connectionKey")
+                if (DEBUG_FORWARDING) Log.d(TAG, "TCP connection pending: $directionalKey")
             }
 
             // If the channel is connected, write data
-            if (channel != null && channel.isConnected) {
+            if (channel!!.isConnected) {
                 // Extract payload from IP packet
                 data.position(0)
                 val packetObj = Packet(data.duplicate())
@@ -432,19 +512,23 @@ class SageService : VpnService() {
             Log.e(TAG, "Error handling TCP packet: ${e.message}", e)
 
             // Close and remove the failed connection
-            tcpConnections.remove(connectionKey)?.close()
+            tcpConnections.remove(normalizedKey)?.close()
+            tcpConnectionDirections.remove(normalizedKey)
         }
     }
 
+    // Modified UDP connection methods
     private fun handleUdpPacket(sourceIp: String, destIp: String, sourcePort: Int, destPort: Int, data: ByteBuffer) {
-        val connectionKey = "$sourceIp:$sourcePort-$destIp:$destPort"
+        val endpoints = ConnectionEndpoints.create(sourceIp, sourcePort, destIp, destPort)
+        val normalizedKey = endpoints.toNormalizedKey()
+        val directionalKey = endpoints.toDirectionalKey(sourceIp, sourcePort)
 
         try {
-            // Get or create UDP connection
-            var channel = udpConnections[connectionKey]
+            // Get or create UDP connection using the normalized key
+            var channel = udpConnections[normalizedKey]
 
             if (channel == null) {
-                if (DEBUG_CONNECTIONS) Log.d(TAG, "Creating new UDP connection: $connectionKey")
+                if (DEBUG_CONNECTIONS) Log.d(TAG, "Creating new UDP connection: $directionalKey (normalized: $normalizedKey)")
 
                 // Create new UDP connection
                 channel = DatagramChannel.open()
@@ -452,10 +536,10 @@ class SageService : VpnService() {
                 // Protect this socket from VPN
                 val socketProtected = protect(channel.socket())
                 if (!socketProtected) {
-                    Log.e(TAG, "ERROR: Failed to protect UDP socket: $connectionKey")
+                    Log.e(TAG, "ERROR: Failed to protect UDP socket: $directionalKey")
                     throw IOException("Failed to protect socket from VPN loopback")
                 } else {
-                    Log.d(TAG, "UDP socket protected from VPN: $connectionKey (localPort=${channel.socket().localPort})")
+                    Log.d(TAG, "UDP socket protected from VPN: $directionalKey (localPort=${channel.socket().localPort})")
                 }
 
                 channel.configureBlocking(false)
@@ -465,12 +549,14 @@ class SageService : VpnService() {
                 channel.connect(destAddress)
 
                 // Register with selector for non-blocking I/O
-                channel.register(selector, SelectionKey.OP_READ, connectionKey)
+                channel.register(selector, SelectionKey.OP_READ, normalizedKey)
 
-                // Store the connection
-                udpConnections[connectionKey] = channel
+                // Store the connection with normalized key
+                udpConnections[normalizedKey] = channel
+                // Store the directional key for this connection
+                udpConnectionDirections[normalizedKey] = directionalKey
 
-                if (DEBUG_FORWARDING) Log.d(TAG, "UDP connection created: $connectionKey")
+                if (DEBUG_FORWARDING) Log.d(TAG, "UDP connection created: $directionalKey")
             }
 
             // Extract payload from IP packet
@@ -495,25 +581,29 @@ class SageService : VpnService() {
 
                 if (DEBUG_FORWARDING) Log.d(TAG, "UDP forwarded $bytesSent bytes to $destIp:$destPort")
             } ?: run {
-                Log.e(TAG, "Failed to create UDP connection for $connectionKey")
+                Log.e(TAG, "Failed to create UDP connection for $directionalKey")
             }
         } catch (e: Exception) {
             Log.e(TAG, "Error handling UDP packet: ${e.message}", e)
 
             // Close and remove the failed connection
-            udpConnections.remove(connectionKey)?.close()
+            udpConnections.remove(normalizedKey)?.close()
+            udpConnectionDirections.remove(normalizedKey)
         }
     }
 
+    // Modified TCP IPv6 connection method
     private fun handleTcpPacketIpv6(sourceIp: String, destIp: String, sourcePort: Int, destPort: Int, data: ByteBuffer) {
-        val connectionKey = "$sourceIp:$sourcePort-$destIp:$destPort"
+        val endpoints = ConnectionEndpoints.create(sourceIp, sourcePort, destIp, destPort)
+        val normalizedKey = endpoints.toNormalizedKey()
+        val directionalKey = endpoints.toDirectionalKey(sourceIp, sourcePort)
 
         try {
-            // Get or create TCP connection
-            var channel = tcpConnections[connectionKey]
+            // Get or create TCP connection using the normalized key
+            var channel = tcpConnections[normalizedKey]
 
             if (channel == null || !channel.isConnected) {
-                if (DEBUG_CONNECTIONS) Log.d(TAG, "Creating new IPv6 TCP connection: $connectionKey")
+                if (DEBUG_CONNECTIONS) Log.d(TAG, "Creating new IPv6 TCP connection: $directionalKey (normalized: $normalizedKey)")
 
                 // Create new TCP connection
                 channel = SocketChannel.open()
@@ -521,10 +611,10 @@ class SageService : VpnService() {
                 // IMPORTANT: Protect the socket first, before any other operations
                 val socketProtected = protect(channel.socket())
                 if (!socketProtected) {
-                    Log.e(TAG, "ERROR: Failed to protect IPv6 TCP socket: $connectionKey")
+                    Log.e(TAG, "ERROR: Failed to protect IPv6 TCP socket: $directionalKey")
                     throw IOException("Failed to protect IPv6 socket from VPN loopback")
                 } else {
-                    Log.d(TAG, "IPv6 TCP socket protected from VPN: $connectionKey")
+                    Log.d(TAG, "IPv6 TCP socket protected from VPN: $directionalKey")
                 }
 
                 // Now configure the socket
@@ -540,12 +630,14 @@ class SageService : VpnService() {
                     channel.connect(destAddress)
 
                     // Register with selector for non-blocking I/O
-                    channel.register(selector, SelectionKey.OP_CONNECT or SelectionKey.OP_READ, connectionKey)
+                    channel.register(selector, SelectionKey.OP_CONNECT or SelectionKey.OP_READ, normalizedKey)
 
-                    // Store the connection
-                    tcpConnections[connectionKey] = channel
+                    // Store the connection with normalized key
+                    tcpConnections[normalizedKey] = channel
+                    // Store the directional key for this connection
+                    tcpConnectionDirections[normalizedKey] = directionalKey
 
-                    if (DEBUG_FORWARDING) Log.d(TAG, "IPv6 TCP connection pending: $connectionKey")
+                    if (DEBUG_FORWARDING) Log.d(TAG, "IPv6 TCP connection pending: $directionalKey")
                 } catch (e: Exception) {
                     Log.e(TAG, "IPv6 address parsing error: ${e.message}", e)
                     throw e
@@ -571,29 +663,33 @@ class SageService : VpnService() {
 
                 if (DEBUG_FORWARDING) Log.d(TAG, "IPv6 TCP forwarded $bytesWritten bytes to $destIp:$destPort")
             } else {
-                if (DEBUG_FORWARDING) Log.d(TAG, "IPv6 TCP connection not yet established: $connectionKey")
+                if (DEBUG_FORWARDING) Log.d(TAG, "IPv6 TCP connection not yet established: $directionalKey")
             }
         } catch (e: Exception) {
             Log.e(TAG, "Error handling IPv6 TCP packet: ${e.message}", e)
 
             // Close and remove the failed connection
             try {
-                tcpConnections.remove(connectionKey)?.close()
+                tcpConnections.remove(normalizedKey)?.close()
+                tcpConnectionDirections.remove(normalizedKey)
             } catch (closeEx: Exception) {
                 Log.e(TAG, "Error closing IPv6 TCP connection", closeEx)
             }
         }
     }
 
+    // Modified UDP IPv6 connection method
     private fun handleUdpPacketIpv6(sourceIp: String, destIp: String, sourcePort: Int, destPort: Int, data: ByteBuffer) {
-        val connectionKey = "$sourceIp:$sourcePort-$destIp:$destPort"
+        val endpoints = ConnectionEndpoints.create(sourceIp, sourcePort, destIp, destPort)
+        val normalizedKey = endpoints.toNormalizedKey()
+        val directionalKey = endpoints.toDirectionalKey(sourceIp, sourcePort)
 
         try {
-            // Get or create UDP connection
-            var channel = udpConnections[connectionKey]
+            // Get or create UDP connection using the normalized key
+            var channel = udpConnections[normalizedKey]
 
             if (channel == null) {
-                if (DEBUG_CONNECTIONS) Log.d(TAG, "Creating new IPv6 UDP connection: $connectionKey")
+                if (DEBUG_CONNECTIONS) Log.d(TAG, "Creating new IPv6 UDP connection: $directionalKey (normalized: $normalizedKey)")
 
                 // Create new UDP connection
                 channel = DatagramChannel.open()
@@ -601,10 +697,10 @@ class SageService : VpnService() {
                 // IMPORTANT: Protect the socket first, before any other operations
                 val socketProtected = protect(channel.socket())
                 if (!socketProtected) {
-                    Log.e(TAG, "ERROR: Failed to protect IPv6 UDP socket: $connectionKey")
+                    Log.e(TAG, "ERROR: Failed to protect IPv6 UDP socket: $directionalKey")
                     throw IOException("Failed to protect IPv6 socket from VPN loopback")
                 } else {
-                    Log.d(TAG, "IPv6 UDP socket protected from VPN: $connectionKey")
+                    Log.d(TAG, "IPv6 UDP socket protected from VPN: $directionalKey")
                 }
 
                 // Now configure the socket
@@ -624,12 +720,14 @@ class SageService : VpnService() {
                     channel.connect(destAddress)
 
                     // Register with selector for non-blocking I/O
-                    channel.register(selector, SelectionKey.OP_READ, connectionKey)
+                    channel.register(selector, SelectionKey.OP_READ, normalizedKey)
 
-                    // Store the connection
-                    udpConnections[connectionKey] = channel
+                    // Store the connection with normalized key
+                    udpConnections[normalizedKey] = channel
+                    // Store the directional key for this connection
+                    udpConnectionDirections[normalizedKey] = directionalKey
 
-                    if (DEBUG_FORWARDING) Log.d(TAG, "IPv6 UDP connection created: $connectionKey")
+                    if (DEBUG_FORWARDING) Log.d(TAG, "IPv6 UDP connection created: $directionalKey")
                 } catch (e: Exception) {
                     Log.e(TAG, "IPv6 address parsing error: ${e.message}", e)
                     throw e
@@ -660,7 +758,8 @@ class SageService : VpnService() {
 
             // Close and remove the failed connection
             try {
-                udpConnections.remove(connectionKey)?.close()
+                udpConnections.remove(normalizedKey)?.close()
+                udpConnectionDirections.remove(normalizedKey)
             } catch (closeEx: Exception) {
                 Log.e(TAG, "Error closing IPv6 UDP connection", closeEx)
             }
@@ -732,7 +831,7 @@ class SageService : VpnService() {
 
     private fun handleConnectable(key: SelectionKey) {
         val channel = key.channel() as SocketChannel
-        val connectionKey = key.attachment() as? String ?: "unknown"
+        val normalizedKey = key.attachment() as? String ?: "unknown"
 
         // Complete connection
         if (channel.isConnectionPending) {
@@ -740,70 +839,62 @@ class SageService : VpnService() {
                 val connected = channel.finishConnect()
 
                 if (connected) {
-                    // Extract destination info from connectionKey
-                    val parts = connectionKey.split("-")
-                    if (parts.size == 2) {
-                        val destParts = parts[1].split(":")
-                        if (destParts.size == 2) {
-                            val destIp = destParts[0]
-                            val destPort = destParts[1]
-                            Log.d(TAG, "Connection to $destIp:$destPort established successfully")
-                        }
-                    }
+                    // Get the directional key for logging
+                    val directionalKey = tcpConnectionDirections[normalizedKey] ?: normalizedKey
+
+                    // Extract destination info from directional key
+                    val endpoints = ConnectionEndpoints.fromConnectionKey(directionalKey)
+                    Log.d(TAG, "Connection to ${endpoints.ip2}:${endpoints.port2} established successfully")
 
                     if (DEBUG_CONNECTIONS) {
-                        Log.d(TAG, "TCP connection established: $connectionKey")
+                        Log.d(TAG, "TCP connection established: $directionalKey (normalized: $normalizedKey)")
                     }
 
                     // Update interest to read
                     key.interestOps(SelectionKey.OP_READ)
                 } else {
-                    Log.e(TAG, "Failed to establish connection: $connectionKey")
+                    val directionalKey = tcpConnectionDirections[normalizedKey] ?: normalizedKey
+                    Log.e(TAG, "Failed to establish connection: $directionalKey")
                     key.cancel()
                     channel.close()
 
                     // Remove from connections map
-                    tcpConnections.remove(connectionKey)
+                    tcpConnections.remove(normalizedKey)
+                    tcpConnectionDirections.remove(normalizedKey)
                 }
             } catch (e: Exception) {
-                Log.e(TAG, "Error finishing connection: ${e.message}", e)
+                val directionalKey = tcpConnectionDirections[normalizedKey] ?: normalizedKey
+                Log.e(TAG, "Error finishing connection: ${e.message}")
                 key.cancel()
                 channel.close()
-                tcpConnections.remove(connectionKey)
+                tcpConnections.remove(normalizedKey)
+                tcpConnectionDirections.remove(normalizedKey)
             }
         }
     }
 
+    // Modify handleReadable method to work with normalized keys
     private fun handleReadable(key: SelectionKey, buffer: ByteBuffer, outStream: FileOutputStream) {
-        val connectionKey = key.attachment() as String
-        val parts = connectionKey.split("-")
-        val sourceParts = parts[0].split(":")
-        val destParts = parts[1].split(":")
+        val normalizedKey = key.attachment() as String
 
-        // Need special handling for IPv6 addresses which contain multiple colons
-        val isIpv6 = sourceParts.size > 2 || destParts.size > 2
-
-        // Extract source and destination differently for IPv4 and IPv6
-        val sourceIp: String
-        val destIp: String
-        val sourcePort: Int
-        val destPort: Int
-
-        if (isIpv6) {
-            // For IPv6, the last part is the port
-            sourcePort = sourceParts.last().toInt()
-            destPort = destParts.last().toInt()
-
-            // And the address is everything else
-            sourceIp = sourceParts.dropLast(1).joinToString(":")
-            destIp = destParts.dropLast(1).joinToString(":")
+        // Get the directional key that was originally stored
+        val directionKey = if (key.channel() is SocketChannel) {
+            tcpConnectionDirections[normalizedKey] ?: normalizedKey
         } else {
-            // Standard IPv4 handling
-            sourceIp = sourceParts[0]
-            sourcePort = sourceParts[1].toInt()
-            destIp = destParts[0]
-            destPort = destParts[1].toInt()
+            udpConnectionDirections[normalizedKey] ?: normalizedKey
         }
+
+        // Parse the connection endpoints
+        val endpoints = ConnectionEndpoints.fromConnectionKey(directionKey)
+
+        // For responses, we swap the source and destination
+        val sourceIp = endpoints.ip2
+        val destIp = endpoints.ip1
+        val sourcePort = endpoints.port2
+        val destPort = endpoints.port1
+
+        // Determine if this is IPv6
+        val isIpv6 = sourceIp.contains(":")
 
         // Clear buffer for new data
         buffer.clear()
@@ -817,10 +908,11 @@ class SageService : VpnService() {
                 if (bytesRead <= 0) {
                     // Connection closed or error
                     if (bytesRead < 0) {
-                        if (DEBUG_CONNECTIONS) Log.d(TAG, "TCP connection closed: $connectionKey")
+                        if (DEBUG_CONNECTIONS) Log.d(TAG, "TCP connection closed: $directionKey (normalized: $normalizedKey)")
                         channel.close()
                         key.cancel()
-                        tcpConnections.remove(connectionKey)
+                        tcpConnections.remove(normalizedKey)
+                        tcpConnectionDirections.remove(normalizedKey)
 
                         // Also remove state entry
                         val reversedKey = "$destIp:$destPort-$sourceIp:$sourcePort"
@@ -828,6 +920,8 @@ class SageService : VpnService() {
                     }
                     return
                 }
+
+                Log.d("SAGEVPN-RESPONSE-TCP", buffer.duplicate().array().joinToString(" ") { "%02X".format(it) })
 
                 // Get or create connection state for this flow (reversed for response)
                 val reversedKey = "$destIp:$destPort-$sourceIp:$sourcePort"
@@ -841,7 +935,7 @@ class SageService : VpnService() {
                 connectionState.remoteSeqNum += bytesRead
 
                 if (DEBUG_FORWARDING) {
-                    Log.d(TAG, "TCP received $bytesRead bytes from $destIp:$destPort")
+                    Log.d(TAG, "TCP received $bytesRead bytes from $sourceIp:$sourcePort")
                 }
 
                 // Prepare buffer for sending
@@ -849,11 +943,11 @@ class SageService : VpnService() {
 
                 // Create and send response packet based on IP version
                 if (isIpv6) {
-                    createAndSendTcpPacketIpv6(destIp, sourceIp, destPort, sourcePort, buffer, bytesRead, outStream)
-                    Log.d(TAG, "IPv6 TCP response delivered to app: $sourceIp:$sourcePort ($bytesRead bytes)")
+                    createAndSendTcpPacketIpv6(sourceIp, destIp, sourcePort, destPort, buffer, bytesRead, outStream)
+                    Log.d(TAG, "IPv6 TCP response delivered to app: $destIp:$destPort ($bytesRead bytes)")
                 } else {
-                    createAndSendTcpPacket(destIp, sourceIp, destPort, sourcePort, buffer, bytesRead, outStream)
-                    Log.d(TAG, "IPv4 TCP response delivered to app: $sourceIp:$sourcePort ($bytesRead bytes)")
+                    createAndSendTcpPacket(sourceIp, destIp, sourcePort, destPort, buffer, bytesRead, outStream)
+                    Log.d(TAG, "IPv4 TCP response delivered to app: $destIp:$destPort ($bytesRead bytes)")
                 }
 
             } else if (key.channel() is DatagramChannel) {
@@ -862,9 +956,9 @@ class SageService : VpnService() {
                 val bytesRead = channel.read(buffer)
 
                 if (bytesRead <= 0) return
-
+                Log.d("SAGEVPN-RESPONSE-UDP", buffer.duplicate().array().joinToString(" ") { "%02X".format(it) })
                 if (DEBUG_FORWARDING) {
-                    Log.d(TAG, "UDP received $bytesRead bytes from $destIp:$destPort")
+                    Log.d(TAG, "UDP received $bytesRead bytes from $sourceIp:$sourcePort")
                 }
 
                 // Prepare buffer for sending
@@ -872,11 +966,11 @@ class SageService : VpnService() {
 
                 // Create and send response packet based on IP version
                 if (isIpv6) {
-                    createAndSendUdpPacketIpv6(destIp, sourceIp, destPort, sourcePort, buffer, bytesRead, outStream)
-                    Log.d(TAG, "IPv6 UDP response delivered to app: $sourceIp:$sourcePort ($bytesRead bytes)")
+                    createAndSendUdpPacketIpv6(sourceIp, destIp, sourcePort, destPort, buffer, bytesRead, outStream)
+                    Log.d(TAG, "IPv6 UDP response delivered to app: $destIp:$destPort ($bytesRead bytes)")
                 } else {
-                    createAndSendUdpPacket(destIp, sourceIp, destPort, sourcePort, buffer, bytesRead, outStream)
-                    Log.d(TAG, "IPv4 UDP response delivered to app: $sourceIp:$sourcePort ($bytesRead bytes)")
+                    createAndSendUdpPacket(sourceIp, destIp, sourcePort, destPort, buffer, bytesRead, outStream)
+                    Log.d(TAG, "IPv4 UDP response delivered to app: $destIp:$destPort ($bytesRead bytes)")
                 }
             }
         } catch (e: Exception) {
@@ -886,13 +980,15 @@ class SageService : VpnService() {
                 key.channel().close()
 
                 if (key.channel() is SocketChannel) {
-                    tcpConnections.remove(connectionKey)
+                    tcpConnections.remove(normalizedKey)
+                    tcpConnectionDirections.remove(normalizedKey)
 
                     // Also remove state entry
                     val reversedKey = "$destIp:$destPort-$sourceIp:$sourcePort"
                     tcpConnectionStates.remove(reversedKey)
                 } else if (key.channel() is DatagramChannel) {
-                    udpConnections.remove(connectionKey)
+                    udpConnections.remove(normalizedKey)
+                    udpConnectionDirections.remove(normalizedKey)
                 }
             } catch (closeErr: Exception) {
                 Log.e(TAG, "Error cleaning up channel resources", closeErr)
