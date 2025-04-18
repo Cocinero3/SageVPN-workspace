@@ -28,13 +28,21 @@ import java.util.concurrent.atomic.AtomicInteger
 
 private data class TcpConnectionState(
     val connectionKey: String,
-    var localSeqNum: Long = 1000L,  // Initial sequence number
+    var localSeqNum: Long = (Math.random() * 1000000).toLong(),  // More random initial sequence number
     var remoteSeqNum: Long = 0L,    // Last sequence number received
     var lastAckSent: Long = 0L,     // Last ACK we sent
-    var windowSize: Int = 65535     // TCP window size
+    var windowSize: Int = 65535,    // TCP window size
+    var state: TcpState = TcpState.CLOSED,
+    var retries: Int = 0
 )
 
+enum class TcpState {
+    CLOSED, SYN_SENT, ESTABLISHED, FIN_WAIT, CLOSE_WAIT, LAST_ACK
+}
+
 class SageService : VpnService() {
+    private val TCP_MAX_RETRIES = 3
+    private val TCP_RETRY_TIMEOUT_MS = 2000L
     private var running = AtomicBoolean(true)
     private var vpnInterface: ParcelFileDescriptor? = null
     private var vpnThread: Thread? = null
@@ -163,15 +171,11 @@ class SageService : VpnService() {
             val builder = Builder()
                 .setSession("SageVPN")
                 .addAddress("10.0.0.2", 32)
-                .addAddress("fd00:1:fd00:1:fd00:1:fd00:1", 128)  // IPv6 address
                 .addDnsServer("8.8.8.8")
                 .addDnsServer("8.8.4.4")
-                .addDnsServer("2001:4860:4860::8888")  // IPv6 DNS
                 .addRoute("0.0.0.0", 0)  // Route all IPv4 traffic
-                .addRoute("::", 0)        // Route all IPv6 traffic
                 .setMtu(BUFFER_SIZE)
                 .allowFamily(android.system.OsConstants.AF_INET)  // Allow IPv4
-                .allowFamily(android.system.OsConstants.AF_INET6) // Allow IPv6
 
             vpnInterface = builder.establish()
 
@@ -386,6 +390,15 @@ class SageService : VpnService() {
             if (channel == null || !channel.isConnected) {
                 if (DEBUG_CONNECTIONS) Log.d(TAG, "Creating new TCP connection: $connectionKey")
 
+                // Create TCP state for the connection first
+                val stateKey = "$sourceIp:$sourcePort-$destIp:$destPort"
+                var connectionState = tcpConnectionStates[stateKey]
+                if (connectionState == null) {
+                    connectionState = TcpConnectionState(stateKey)
+                    connectionState.state = TcpState.SYN_SENT
+                    tcpConnectionStates[stateKey] = connectionState
+                }
+
                 // Create new TCP connection
                 channel = SocketChannel.open()
 
@@ -402,37 +415,107 @@ class SageService : VpnService() {
 
                 // Connect to destination
                 val destAddress = InetSocketAddress(destIp, destPort)
-                channel.connect(destAddress)
+                val connectStarted = channel.connect(destAddress)
+
+                if (connectStarted) {
+                    // Connection completed immediately
+                    connectionState.state = TcpState.ESTABLISHED
+                    if (DEBUG_FORWARDING) Log.d(TAG, "TCP connection established immediately: $connectionKey")
+                } else {
+                    // Connection pending
+                    if (DEBUG_FORWARDING) Log.d(TAG, "TCP connection pending: $connectionKey")
+                }
 
                 // Register with selector for non-blocking I/O
                 channel.register(selector, SelectionKey.OP_CONNECT or SelectionKey.OP_READ, connectionKey)
 
                 // Store the connection
                 tcpConnections[connectionKey] = channel
+            }
 
-                if (DEBUG_FORWARDING) Log.d(TAG, "TCP connection pending: $connectionKey")
+            // Extract TCP flags and update connection state
+            val packet = Packet(data.duplicate())
+            val ipHeaderLen = (packet.ipv4Headers?.internetHeaderLength?.toInt() ?: 5) * 4
+            val tcpHeaderOffset = ipHeaderLen
+
+            // Read TCP flags
+            if (data.capacity() >= tcpHeaderOffset + 13) {
+                data.position(tcpHeaderOffset + 13)
+                val flags = data.get().toInt() and 0xFF
+
+                // TCP flags processing
+                val isSyn = (flags and 0x02) != 0
+                val isAck = (flags and 0x10) != 0
+                val isRst = (flags and 0x04) != 0
+                val isFin = (flags and 0x01) != 0
+
+                // Get connection state
+                val stateKey = "$sourceIp:$sourcePort-$destIp:$destPort"
+                val connectionState = tcpConnectionStates[stateKey]
+
+                if (isRst) {
+                    // Handle RST - close connection
+                    if (DEBUG_CONNECTIONS) Log.d(TAG, "TCP RST received, closing: $connectionKey")
+                    channel?.close()
+                    tcpConnections.remove(connectionKey)
+                    tcpConnectionStates.remove(stateKey)
+                    return
+                }
+
+                if (isFin) {
+                    // Handle FIN - acknowledge it
+                    if (connectionState != null) {
+                        connectionState.state = TcpState.FIN_WAIT
+                        if (DEBUG_CONNECTIONS) Log.d(TAG, "TCP FIN received, sending ACK: $connectionKey")
+                    }
+                }
             }
 
             // If the channel is connected, write data
             if (channel != null && channel.isConnected) {
-                // Extract payload from IP packet
+                // Extract payload from IP packet - with correct offsets
                 data.position(0)
                 val packetObj = Packet(data.duplicate())
-                val headerSize = (packetObj.ipv4Headers?.internetHeaderLength?.toInt() ?: 5) * 4
+                val ipHeaderLen = (packetObj.ipv4Headers?.internetHeaderLength?.toInt() ?: 5) * 4
 
-                // Position buffer to skip IP header
-                data.position(headerSize)
+                // Get TCP header length
+                data.position(ipHeaderLen + 12)
+                val dataOffset = (data.get().toInt() and 0xF0) shr 4
+                val tcpHeaderLen = dataOffset * 4
 
-                // Write data to channel
-                val bytesWritten = channel.write(data)
+                // Position buffer to skip IP header and TCP header
+                data.position(ipHeaderLen + tcpHeaderLen)
 
-                if (DEBUG_FORWARDING) Log.d(TAG, "TCP forwarded $bytesWritten bytes to $destIp:$destPort")
+                // Only write if there's data to send (not just TCP control packets)
+                if (data.hasRemaining()) {
+                    val bytesWritten = channel.write(data)
+                    if (DEBUG_FORWARDING) Log.d(TAG, "TCP forwarded $bytesWritten bytes to $destIp:$destPort")
+                } else if (DEBUG_FORWARDING) {
+                    Log.d(TAG, "TCP control packet (no data payload) to $destIp:$destPort")
+                }
             }
         } catch (e: Exception) {
             Log.e(TAG, "Error handling TCP packet: ${e.message}", e)
 
-            // Close and remove the failed connection
-            tcpConnections.remove(connectionKey)?.close()
+            // Close and remove the failed connection with retries
+            val stateKey = "$sourceIp:$sourcePort-$destIp:$destPort"
+            val connectionState = tcpConnectionStates[stateKey]
+
+            if (connectionState != null && connectionState.retries < TCP_MAX_RETRIES) {
+                connectionState.retries++
+                Log.d(TAG, "TCP connection retry ${connectionState.retries}/$TCP_MAX_RETRIES for $connectionKey")
+
+                // Schedule retry if appropriate
+                if (e is IOException && e.message?.contains("reset") == true) {
+                    // Don't retry on connection reset
+                    tcpConnections.remove(connectionKey)?.close()
+                    tcpConnectionStates.remove(stateKey)
+                }
+            } else {
+                // Max retries reached or no state - close connection
+                tcpConnections.remove(connectionKey)?.close()
+                tcpConnectionStates.remove(stateKey)
+            }
         }
     }
 
@@ -751,6 +834,13 @@ class SageService : VpnService() {
                         }
                     }
 
+                    // Update connection state
+                    val connectionState = tcpConnectionStates[connectionKey]
+                    if (connectionState != null) {
+                        connectionState.state = TcpState.ESTABLISHED
+                        connectionState.retries = 0  // Reset retries on successful connection
+                    }
+
                     if (DEBUG_CONNECTIONS) {
                         Log.d(TAG, "TCP connection established: $connectionKey")
                     }
@@ -759,17 +849,79 @@ class SageService : VpnService() {
                     key.interestOps(SelectionKey.OP_READ)
                 } else {
                     Log.e(TAG, "Failed to establish connection: $connectionKey")
-                    key.cancel()
-                    channel.close()
 
-                    // Remove from connections map
-                    tcpConnections.remove(connectionKey)
+                    // Check for retries
+                    val connectionState = tcpConnectionStates[connectionKey]
+                    if (connectionState != null && connectionState.retries < TCP_MAX_RETRIES) {
+                        // Retry
+                        connectionState.retries++
+                        Log.d(TAG, "Retrying connection ($connectionKey): ${connectionState.retries}/$TCP_MAX_RETRIES")
+
+                        // Keep the key, just update interests
+                        key.interestOps(SelectionKey.OP_CONNECT)
+                    } else {
+                        // Give up
+                        key.cancel()
+                        channel.close()
+                        tcpConnections.remove(connectionKey)
+                        tcpConnectionStates.remove(connectionKey)
+                    }
                 }
             } catch (e: Exception) {
                 Log.e(TAG, "Error finishing connection: ${e.message}", e)
-                key.cancel()
-                channel.close()
-                tcpConnections.remove(connectionKey)
+
+                // Check for retries
+                val connectionState = tcpConnectionStates[connectionKey]
+                if (connectionState != null && connectionState.retries < TCP_MAX_RETRIES) {
+                    // Retry
+                    connectionState.retries++
+                    Log.d(TAG, "Connection error, retrying ($connectionKey): ${connectionState.retries}/$TCP_MAX_RETRIES")
+
+                    try {
+                        // Close existing channel
+                        channel.close()
+                        key.cancel()
+
+                        // Extract connection details
+                        val parts = connectionKey.split("-")
+                        val sourceParts = parts[0].split(":")
+                        val destParts = parts[1].split(":")
+
+                        if (parts.size == 2 && sourceParts.size >= 2 && destParts.size >= 2) {
+                            val sourceIp = sourceParts[0]
+                            val sourcePort = sourceParts[1].toInt()
+                            val destIp = destParts[0]
+                            val destPort = destParts[1].toInt()
+
+                            // Create new channel
+                            val newChannel = SocketChannel.open()
+                            protect(newChannel.socket())
+                            newChannel.configureBlocking(false)
+
+                            // Connect
+                            val destAddress = InetSocketAddress(destIp, destPort)
+                            newChannel.connect(destAddress)
+
+                            // Register with selector
+                            newChannel.register(selector, SelectionKey.OP_CONNECT, connectionKey)
+
+                            // Update map
+                            tcpConnections[connectionKey] = newChannel
+
+                            Log.d(TAG, "Created new connection attempt for $connectionKey")
+                        }
+                    } catch (retryErr: Exception) {
+                        Log.e(TAG, "Failed to retry connection: ${retryErr.message}")
+                        tcpConnections.remove(connectionKey)
+                        tcpConnectionStates.remove(connectionKey)
+                    }
+                } else {
+                    // Give up after retries
+                    key.cancel()
+                    try { channel.close() } catch (_: Exception) { }
+                    tcpConnections.remove(connectionKey)
+                    tcpConnectionStates.remove(connectionKey)
+                }
             }
         }
     }
@@ -789,6 +941,7 @@ class SageService : VpnService() {
         val sourcePort: Int
         val destPort: Int
 
+        // Parse connection info
         if (isIpv6) {
             // For IPv6, the last part is the port
             sourcePort = sourceParts.last().toInt()
@@ -814,31 +967,49 @@ class SageService : VpnService() {
                 val channel = key.channel() as SocketChannel
                 val bytesRead = channel.read(buffer)
 
+                // Reverse key for looking up connection state
+                val reversedKey = "$destIp:$destPort-$sourceIp:$sourcePort"
+                val connectionState = tcpConnectionStates[reversedKey]
+
                 if (bytesRead <= 0) {
                     // Connection closed or error
                     if (bytesRead < 0) {
                         if (DEBUG_CONNECTIONS) Log.d(TAG, "TCP connection closed: $connectionKey")
+
+                        // Set connection state if exists
+                        if (connectionState != null) {
+                            connectionState.state = TcpState.CLOSE_WAIT
+                        }
+
+                        // For clean TCP termination, we should send a FIN packet here
+                        if (connectionState != null) {
+                            // Create a FIN packet
+                            val finBuffer = ByteBuffer.allocate(0)  // No data
+                            createAndSendTcpPacketWithFlags(
+                                destIp, sourceIp, destPort, sourcePort,
+                                finBuffer, 0, outStream, true
+                            )
+
+                            if (DEBUG_CONNECTIONS) Log.d(TAG, "Sent FIN packet for closed connection")
+                            connectionState.state = TcpState.LAST_ACK
+                        }
+
                         channel.close()
                         key.cancel()
                         tcpConnections.remove(connectionKey)
-
-                        // Also remove state entry
-                        val reversedKey = "$destIp:$destPort-$sourceIp:$sourcePort"
                         tcpConnectionStates.remove(reversedKey)
                     }
                     return
                 }
 
-                // Get or create connection state for this flow (reversed for response)
-                val reversedKey = "$destIp:$destPort-$sourceIp:$sourcePort"
-                var connectionState = tcpConnectionStates[reversedKey]
-                if (connectionState == null) {
-                    connectionState = TcpConnectionState(reversedKey)
-                    tcpConnectionStates[reversedKey] = connectionState
+                // Create or update connection state for this flow
+                val state = connectionState ?: TcpConnectionState(reversedKey).apply {
+                    tcpConnectionStates[reversedKey] = this
+                    state = TcpState.ESTABLISHED
                 }
 
                 // Update remote sequence number
-                connectionState.remoteSeqNum += bytesRead
+                state.remoteSeqNum += bytesRead
 
                 if (DEBUG_FORWARDING) {
                     Log.d(TAG, "TCP received $bytesRead bytes from $destIp:$destPort")
@@ -855,9 +1026,8 @@ class SageService : VpnService() {
                     createAndSendTcpPacket(destIp, sourceIp, destPort, sourcePort, buffer, bytesRead, outStream)
                     Log.d(TAG, "IPv4 TCP response delivered to app: $sourceIp:$sourcePort ($bytesRead bytes)")
                 }
-
             } else if (key.channel() is DatagramChannel) {
-                // UDP channel
+                // UDP handling (remains largely unchanged)
                 val channel = key.channel() as DatagramChannel
                 val bytesRead = channel.read(buffer)
 
@@ -887,8 +1057,6 @@ class SageService : VpnService() {
 
                 if (key.channel() is SocketChannel) {
                     tcpConnections.remove(connectionKey)
-
-                    // Also remove state entry
                     val reversedKey = "$destIp:$destPort-$sourceIp:$sourcePort"
                     tcpConnectionStates.remove(reversedKey)
                 } else if (key.channel() is DatagramChannel) {
@@ -897,6 +1065,129 @@ class SageService : VpnService() {
             } catch (closeErr: Exception) {
                 Log.e(TAG, "Error cleaning up channel resources", closeErr)
             }
+        }
+    }
+
+    // New helper method to handle TCP packets with specific flags
+    private fun createAndSendTcpPacketWithFlags(
+        sourceIp: String,
+        destIp: String,
+        sourcePort: Int,
+        destPort: Int,
+        payload: ByteBuffer,
+        payloadSize: Int,
+        outStream: FileOutputStream,
+        isFin: Boolean = false
+    ) {
+        val connectionKey = "$destIp:$destPort-$sourceIp:$sourcePort"  // Reversed for response
+        try {
+            // Get connection state
+            val connectionState = tcpConnectionStates[connectionKey] ?: return
+
+            // 1. Create IP header (20 bytes)
+            val ipHeader = ByteBuffer.allocate(20)
+            ipHeader.put(0, (4 shl 4 or 5).toByte())  // Version 4, Header Length 5 (20 bytes)
+            ipHeader.put(1, 0)  // ToS
+            val totalLength = 20 + 20 + payloadSize  // IP + TCP + Payload
+            ipHeader.putShort(2, totalLength.toShort())
+            ipHeader.putShort(4, (Math.random() * 65535).toInt().toShort())  // ID
+            ipHeader.putShort(6, 0x4000.toShort())  // Don't Fragment
+            ipHeader.put(8, 64)  // TTL
+            ipHeader.put(9, 6)  // Protocol (TCP)
+            ipHeader.putShort(10, 0)  // Checksum (calculated later)
+
+            // Source IP
+            val srcIpParts = sourceIp.split(".")
+            for (i in 0..3) {
+                ipHeader.put(12 + i, srcIpParts[i].toInt().toByte())
+            }
+
+            // Destination IP
+            val dstIpParts = destIp.split(".")
+            for (i in 0..3) {
+                ipHeader.put(16 + i, dstIpParts[i].toInt().toByte())
+            }
+
+            // 2. Create TCP header (20 bytes)
+            val tcpHeader = ByteBuffer.allocate(20)
+            tcpHeader.putShort(0, sourcePort.toShort())
+            tcpHeader.putShort(2, destPort.toShort())
+
+            // Sequence number
+            tcpHeader.putInt(4, connectionState.localSeqNum.toInt())
+
+            // ACK number
+            tcpHeader.putInt(8, connectionState.remoteSeqNum.toInt())
+
+            // Set flags based on parameters
+            var flags = 0x10  // ACK is always set
+            if (isFin) flags = flags or 0x01  // FIN flag
+
+            // Data offset and flags
+            tcpHeader.put(12, (5 shl 4).toByte())  // Header length 5 words (20 bytes)
+            tcpHeader.put(13, flags.toByte())
+
+            // Window size
+            tcpHeader.putShort(14, connectionState.windowSize.toShort())
+
+            // Checksum and urgent pointer
+            tcpHeader.putShort(16, 0)  // Checksum (calculated later)
+            tcpHeader.putShort(18, 0)  // Urgent pointer
+
+            // Calculate checksums
+            val pseudoHeader = ByteBuffer.allocate(12)
+            // Source IP
+            for (i in 0..3) {
+                pseudoHeader.put(i, ipHeader.get(12 + i))
+            }
+            // Destination IP
+            for (i in 0..3) {
+                pseudoHeader.put(4 + i, ipHeader.get(16 + i))
+            }
+            pseudoHeader.put(8, 0)  // Zero
+            pseudoHeader.put(9, 6)  // Protocol
+            pseudoHeader.putShort(10, (20 + payloadSize).toShort())  // TCP length
+
+            // Create combined data for TCP checksum
+            val payloadData = ByteArray(payloadSize)
+            if (payloadSize > 0) {
+                payload.get(payloadData)
+            }
+
+            val tcpChecksumData = ByteArray(pseudoHeader.capacity() + tcpHeader.capacity() + payloadSize)
+            System.arraycopy(pseudoHeader.array(), 0, tcpChecksumData, 0, pseudoHeader.capacity())
+            System.arraycopy(tcpHeader.array(), 0, tcpChecksumData, pseudoHeader.capacity(), tcpHeader.capacity())
+            if (payloadSize > 0) {
+                System.arraycopy(payloadData, 0, tcpChecksumData, pseudoHeader.capacity() + tcpHeader.capacity(), payloadSize)
+            }
+
+            val tcpChecksum = calculateChecksumImproved(tcpChecksumData)
+            tcpHeader.putShort(16, tcpChecksum)
+
+            // Calculate IP checksum
+            val ipChecksum = calculateChecksumImproved(ipHeader.array())
+            ipHeader.putShort(10, ipChecksum)
+
+            // Build and send the complete packet
+            val packet = ByteBuffer.allocate(totalLength)
+            ipHeader.position(0)
+            tcpHeader.position(0)
+
+            packet.put(ipHeader)
+            packet.put(tcpHeader)
+            if (payloadSize > 0) {
+                packet.put(payloadData)
+            }
+
+            outStream.write(packet.array(), 0, totalLength)
+
+            // If sending FIN, increment seq num by 1
+            if (isFin) {
+                connectionState.localSeqNum += 1
+                Log.d(TAG, "TCP FIN sent: $sourceIp:$sourcePort -> $destIp:$destPort")
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Error sending TCP packet with flags: ${e.message}", e)
         }
     }
 
@@ -915,6 +1206,7 @@ class SageService : VpnService() {
             var connectionState = tcpConnectionStates[connectionKey]
             if (connectionState == null) {
                 connectionState = TcpConnectionState(connectionKey)
+                connectionState.state = TcpState.ESTABLISHED  // Assume established for responses
                 tcpConnectionStates[connectionKey] = connectionState
             }
 
@@ -957,9 +1249,10 @@ class SageService : VpnService() {
             // ACK number - acknowledge all data received
             tcpHeader.putInt(8, connectionState.remoteSeqNum.toInt())
 
-            // Data offset and flags
+            // Data offset and flags - always ACK for responses
             tcpHeader.put(12, (5 shl 4).toByte())  // Header length 5 words (20 bytes)
-            tcpHeader.put(13, 0x18.toByte())  // PSH and ACK flags
+            val flags = if (payloadSize > 0) 0x18.toByte() else 0x10.toByte() // PSH+ACK if data, otherwise just ACK
+            tcpHeader.put(13, flags)
 
             // Window size
             tcpHeader.putShort(14, connectionState.windowSize.toShort())
@@ -983,12 +1276,17 @@ class SageService : VpnService() {
             pseudoHeader.put(9, 6)  // Protocol
             pseudoHeader.putShort(10, (20 + payloadSize).toShort())  // TCP length
 
-            // Calculate TCP checksum
-            val tcpChecksum = calculateChecksum(pseudoHeader.array(), tcpHeader.array(), payloadData)
+            // Calculate TCP checksum - including both pseudo-header and payload
+            val tcpChecksumData = ByteArray(pseudoHeader.capacity() + tcpHeader.capacity() + payloadData.size)
+            System.arraycopy(pseudoHeader.array(), 0, tcpChecksumData, 0, pseudoHeader.capacity())
+            System.arraycopy(tcpHeader.array(), 0, tcpChecksumData, pseudoHeader.capacity(), tcpHeader.capacity())
+            System.arraycopy(payloadData, 0, tcpChecksumData, pseudoHeader.capacity() + tcpHeader.capacity(), payloadData.size)
+
+            val tcpChecksum = calculateChecksumImproved(tcpChecksumData)
             tcpHeader.putShort(16, tcpChecksum)
 
             // Calculate IP checksum
-            val ipChecksum = calculateIPChecksum(ipHeader.array())
+            val ipChecksum = calculateChecksumImproved(ipHeader.array())
             ipHeader.putShort(10, ipChecksum)
 
             // 4. Build and send the complete packet
@@ -1005,6 +1303,9 @@ class SageService : VpnService() {
             // Update sequence number for next packet
             connectionState.localSeqNum += payloadSize
 
+            // Update ACK sent
+            connectionState.lastAckSent = connectionState.remoteSeqNum
+
             if (DEBUG_FORWARDING) {
                 Log.d(TAG, "TCP response sent: $sourceIp:$sourcePort -> $destIp:$destPort " +
                         "(SEQ=${connectionState.localSeqNum}, ACK=${connectionState.remoteSeqNum})")
@@ -1012,6 +1313,34 @@ class SageService : VpnService() {
         } catch (e: Exception) {
             Log.e(TAG, "Error creating TCP packet: ${e.message}", e)
         }
+    }
+
+    // Improved checksum calculation
+    private fun calculateChecksumImproved(data: ByteArray): Short {
+        var sum = 0
+        var length = data.size
+        var i = 0
+
+        // Handle complete 16-bit chunks
+        while (length > 1) {
+            val word = ((data[i].toInt() and 0xFF) shl 8) or (data[i + 1].toInt() and 0xFF)
+            sum += word
+            i += 2
+            length -= 2
+        }
+
+        // Handle any remaining byte
+        if (length > 0) {
+            sum += (data[i].toInt() and 0xFF) shl 8
+        }
+
+        // Add carries
+        while (sum > 0xFFFF) {
+            sum = (sum and 0xFFFF) + (sum ushr 16)
+        }
+
+        // Take one's complement
+        return ((sum.inv()) and 0xFFFF).toShort()
     }
 
     // Helper methods for checksums
