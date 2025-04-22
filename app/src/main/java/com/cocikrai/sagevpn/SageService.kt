@@ -25,13 +25,17 @@ import java.net.Socket
 import java.nio.channels.SocketChannel
 import kotlin.concurrent.thread
 import java.util.concurrent.atomic.AtomicInteger
+import kotlin.experimental.and
 
 private data class TcpConnectionState(
     val connectionKey: String,
-    var localSeqNum: Long = 1000L,  // Initial sequence number
-    var remoteSeqNum: Long = 0L,    // Last sequence number received
-    var lastAckSent: Long = 0L,     // Last ACK we sent
-    var windowSize: Int = 65535     // TCP window size
+    var localSeqNum: Long = 1000L,
+    var remoteSeqNum: Long = 0L,
+    var remoteWindowSize: Int = 65535,
+    var lastAckSent: Long = 0L,
+    var windowSize: Int = 65535,
+    var established: Boolean = false,
+    var sentSyn: Boolean = false
 )
 
 private data class ConnectionEndpoints(
@@ -490,6 +494,15 @@ class SageService : VpnService() {
                 // Store the directional key for this connection
                 tcpConnectionDirections[normalizedKey] = directionalKey
 
+                // Create TCP connection state
+                val stateKey = "$sourceIp:$sourcePort-$destIp:$destPort"
+                val connectionState = TcpConnectionState(stateKey)
+
+                // Extract TCP flags and sequence numbers from packet
+                extractTcpInfo(data, connectionState)
+
+                tcpConnectionStates[stateKey] = connectionState
+
                 if (DEBUG_FORWARDING) Log.d(TAG, "TCP connection pending: $directionalKey")
             }
 
@@ -499,6 +512,13 @@ class SageService : VpnService() {
                 data.position(0)
                 val packetObj = Packet(data.duplicate())
                 val headerSize = (packetObj.ipv4Headers?.internetHeaderLength?.toInt() ?: 5) * 4
+                val packetData = data.duplicate()
+
+                // Update TCP state based on packet content
+                val stateKey = "$sourceIp:$sourcePort-$destIp:$destPort"
+                val connectionState = tcpConnectionStates[stateKey] ?: TcpConnectionState(stateKey)
+                extractTcpInfo(packetData, connectionState)
+                tcpConnectionStates[stateKey] = connectionState
 
                 // Position buffer to skip IP header
                 data.position(headerSize)
@@ -506,14 +526,90 @@ class SageService : VpnService() {
                 // Write data to channel
                 val bytesWritten = channel.write(data)
 
-                if (DEBUG_FORWARDING) Log.d(TAG, "TCP forwarded $bytesWritten bytes to $destIp:$destPort")
+                if (DEBUG_FORWARDING) Log.d(TAG, "TCP forwarded $bytesWritten bytes to $destIp:$destPort " +
+                        "(SEQ=${connectionState.remoteSeqNum}, ACK=${connectionState.localSeqNum})")
             }
         } catch (e: Exception) {
             Log.e(TAG, "Error handling TCP packet: ${e.message}", e)
 
             // Close and remove the failed connection
-            tcpConnections.remove(normalizedKey)?.close()
-            tcpConnectionDirections.remove(normalizedKey)
+            try {
+                tcpConnections.remove(normalizedKey)?.close()
+                tcpConnectionDirections.remove(normalizedKey)
+            } catch (closeEx: Exception) {
+                Log.e(TAG, "Error closing TCP connection", closeEx)
+            }
+        }
+    }
+
+    // New method to extract TCP information from packets
+    private fun extractTcpInfo(data: ByteBuffer, state: TcpConnectionState) {
+        try {
+            // Create a duplicate to avoid modifying the original position
+            val buffer = data.duplicate()
+            buffer.position(0)
+
+            // Parse IP header first
+            val packetObj = Packet(buffer.duplicate())
+            val ipHeaderLength = (packetObj.ipv4Headers?.internetHeaderLength?.toInt() ?: 5) * 4
+
+            // Position for TCP header
+            buffer.position(ipHeaderLength)
+
+            // Extract TCP header values
+            val sourcePort = ((buffer.get().toLong() and 0xFF) shl 8) or (buffer.get().toLong() and 0xFF)
+            val destPort = ((buffer.get().toLong() and 0xFF) shl 8) or (buffer.get().toLong() and 0xFF)
+
+            // Sequence number (4 bytes)
+            val seqNum = ((buffer.get().toLong() and 0xFF) shl 24) or
+                    ((buffer.get().toLong() and 0xFF) shl 16) or
+                    ((buffer.get().toLong() and 0xFF) shl 8) or
+                    (buffer.get().toLong() and 0xFF)
+
+            // Acknowledgment number (4 bytes)
+            val ackNum = ((buffer.get().toLong() and 0xFF) shl 24) or
+                    ((buffer.get().toLong() and 0xFF) shl 16) or
+                    ((buffer.get().toLong() and 0xFF) shl 8) or
+                    (buffer.get().toLong() and 0xFF)
+
+            // Data offset and flags
+            val dataOffset = (buffer.get().toInt() and 0xF0) shr 4
+            val flags = buffer.get().toInt() and 0xFF
+
+            // Window size (2 bytes)
+            val windowSize = ((buffer.get().toInt() and 0xFF) shl 8) or (buffer.get().toInt() and 0xFF)
+
+            // Update connection state
+            if ((flags and 0x02) != 0) {  // SYN flag
+                state.remoteSeqNum = seqNum + 1  // SYN consumes one sequence number
+                state.sentSyn = true
+            } else if ((flags and 0x01) != 0) {  // FIN flag
+                state.remoteSeqNum = seqNum + 1  // FIN consumes one sequence number
+            } else {
+                // Calculate payload size
+                val ipTotalLength = packetObj.ipv4Headers?.totalLength?.toInt() ?: 0
+                val tcpHeaderLength = dataOffset * 4
+                val payloadSize = ipTotalLength - ipHeaderLength - tcpHeaderLength
+
+                if (payloadSize > 0) {
+                    state.remoteSeqNum = seqNum + payloadSize
+                } else {
+                    state.remoteSeqNum = seqNum
+                }
+            }
+
+            if ((flags and 0x10) != 0) {  // ACK flag
+                state.localSeqNum = ackNum
+            }
+
+            state.remoteWindowSize = windowSize
+
+            if ((flags and 0x12) == 0x12) {  // SYN+ACK
+                state.established = true
+            }
+
+        } catch (e: Exception) {
+            Log.e(TAG, "Error extracting TCP info: ${e.message}", e)
         }
     }
 
@@ -903,12 +999,61 @@ class SageService : VpnService() {
             if (key.channel() is SocketChannel) {
                 // TCP channel
                 val channel = key.channel() as SocketChannel
-                val bytesRead = channel.read(buffer)
 
-                if (bytesRead <= 0) {
-                    // Connection closed or error
-                    if (bytesRead < 0) {
-                        if (DEBUG_CONNECTIONS) Log.d(TAG, "TCP connection closed: $directionKey (normalized: $normalizedKey)")
+                try {
+                    val bytesRead = channel.read(buffer)
+
+                    if (bytesRead <= 0) {
+                        // Connection closed or error
+                        if (bytesRead < 0) {
+                            if (DEBUG_CONNECTIONS) Log.d(TAG, "TCP connection closed: $directionKey (normalized: $normalizedKey)")
+                            channel.close()
+                            key.cancel()
+                            tcpConnections.remove(normalizedKey)
+                            tcpConnectionDirections.remove(normalizedKey)
+
+                            // Also remove state entry
+                            val reversedKey = "$destIp:$destPort-$sourceIp:$sourcePort"
+                            tcpConnectionStates.remove(reversedKey)
+                        }
+                        return
+                    }
+
+                    if (DEBUG_FORWARDING) {
+                        Log.d(TAG, "TCP received $bytesRead bytes from $sourceIp:$sourcePort")
+                    }
+
+                    // Prepare buffer for sending
+                    buffer.flip()
+
+                    // Get the TCP connection state for proper sequence tracking
+                    val reversedKey = "$destIp:$destPort-$sourceIp:$sourcePort"
+                    val connectionState = tcpConnectionStates[reversedKey] ?: TcpConnectionState(reversedKey)
+
+                    // Update sequence numbers for response
+                    connectionState.localSeqNum += bytesRead
+
+                    // Store updated state
+                    tcpConnectionStates[reversedKey] = connectionState
+
+                    // Create and send response packet based on IP version
+                    if (isIpv6) {
+                        createAndSendTcpPacketIpv6(sourceIp, destIp, sourcePort, destPort, buffer, bytesRead, outStream, connectionState)
+                        Log.d(TAG, "IPv6 TCP response delivered to app: $destIp:$destPort ($bytesRead bytes)")
+                    } else {
+                        createAndSendTcpPacket(sourceIp, destIp, sourcePort, destPort, buffer, bytesRead, outStream, connectionState)
+                        Log.d(TAG, "IPv4 TCP response delivered to app: $destIp:$destPort ($bytesRead bytes)")
+                    }
+                } catch (e: IOException) {
+                    // Handle connection reset specifically with better logging
+                    if (e.message?.contains("Connection reset") == true) {
+                        Log.e(TAG, "TCP connection was reset by peer: $directionKey", e)
+                    } else {
+                        Log.e(TAG, "Error reading from TCP channel: ${e.message}", e)
+                    }
+
+                    // Clean up the connection
+                    try {
                         channel.close()
                         key.cancel()
                         tcpConnections.remove(normalizedKey)
@@ -917,46 +1062,17 @@ class SageService : VpnService() {
                         // Also remove state entry
                         val reversedKey = "$destIp:$destPort-$sourceIp:$sourcePort"
                         tcpConnectionStates.remove(reversedKey)
+                    } catch (closeEx: Exception) {
+                        Log.e(TAG, "Error closing TCP connection after reset", closeEx)
                     }
-                    return
                 }
-
-                Log.d("SAGEVPN-RESPONSE-TCP", buffer.duplicate().array().joinToString(" ") { "%02X".format(it) })
-
-                // Get or create connection state for this flow (reversed for response)
-                val reversedKey = "$destIp:$destPort-$sourceIp:$sourcePort"
-                var connectionState = tcpConnectionStates[reversedKey]
-                if (connectionState == null) {
-                    connectionState = TcpConnectionState(reversedKey)
-                    tcpConnectionStates[reversedKey] = connectionState
-                }
-
-                // Update remote sequence number
-                connectionState.remoteSeqNum += bytesRead
-
-                if (DEBUG_FORWARDING) {
-                    Log.d(TAG, "TCP received $bytesRead bytes from $sourceIp:$sourcePort")
-                }
-
-                // Prepare buffer for sending
-                buffer.flip()
-
-                // Create and send response packet based on IP version
-                if (isIpv6) {
-                    createAndSendTcpPacketIpv6(sourceIp, destIp, sourcePort, destPort, buffer, bytesRead, outStream)
-                    Log.d(TAG, "IPv6 TCP response delivered to app: $destIp:$destPort ($bytesRead bytes)")
-                } else {
-                    createAndSendTcpPacket(sourceIp, destIp, sourcePort, destPort, buffer, bytesRead, outStream)
-                    Log.d(TAG, "IPv4 TCP response delivered to app: $destIp:$destPort ($bytesRead bytes)")
-                }
-
             } else if (key.channel() is DatagramChannel) {
-                // UDP channel
+                // UDP channel - this remains unchanged
                 val channel = key.channel() as DatagramChannel
                 val bytesRead = channel.read(buffer)
 
                 if (bytesRead <= 0) return
-                Log.d("SAGEVPN-RESPONSE-UDP", buffer.duplicate().array().joinToString(" ") { "%02X".format(it) })
+
                 if (DEBUG_FORWARDING) {
                     Log.d(TAG, "UDP received $bytesRead bytes from $sourceIp:$sourcePort")
                 }
@@ -1003,17 +1119,10 @@ class SageService : VpnService() {
         destPort: Int,
         payload: ByteBuffer,
         payloadSize: Int,
-        outStream: FileOutputStream
+        outStream: FileOutputStream,
+        connectionState: TcpConnectionState
     ) {
-        val connectionKey = "$destIp:$destPort-$sourceIp:$sourcePort"  // Reversed for response
         try {
-            // Get or create connection state
-            var connectionState = tcpConnectionStates[connectionKey]
-            if (connectionState == null) {
-                connectionState = TcpConnectionState(connectionKey)
-                tcpConnectionStates[connectionKey] = connectionState
-            }
-
             // Extract payload data
             val payloadData = ByteArray(payloadSize)
             payload.get(payloadData)
@@ -1047,24 +1156,26 @@ class SageService : VpnService() {
             tcpHeader.putShort(0, sourcePort.toShort())
             tcpHeader.putShort(2, destPort.toShort())
 
-            // Sequence number
+            // Sequence number - use tracked sequence number
             tcpHeader.putInt(4, connectionState.localSeqNum.toInt())
 
-            // ACK number - acknowledge all data received
+            // ACK number - acknowledge data received
             tcpHeader.putInt(8, connectionState.remoteSeqNum.toInt())
 
-            // Data offset and flags
+            // Data offset and flags - always include ACK flag for responses
             tcpHeader.put(12, (5 shl 4).toByte())  // Header length 5 words (20 bytes)
+
+            // For responses, we use both ACK (0x10) and PSH (0x08) flags
             tcpHeader.put(13, 0x18.toByte())  // PSH and ACK flags
 
-            // Window size
+            // Window size - use value from state
             tcpHeader.putShort(14, connectionState.windowSize.toShort())
 
             // Checksum and urgent pointer
             tcpHeader.putShort(16, 0)  // Checksum (calculated later)
             tcpHeader.putShort(18, 0)  // Urgent pointer
 
-            // 3. Calculate checksums
+            // 3. Calculate checksums - use more robust checksum calculation
             // TCP checksum requires a pseudo-header
             val pseudoHeader = ByteBuffer.allocate(12)
             // Source IP
@@ -1097,9 +1208,6 @@ class SageService : VpnService() {
             packet.put(payloadData)
 
             outStream.write(packet.array(), 0, totalLength)
-
-            // Update sequence number for next packet
-            connectionState.localSeqNum += payloadSize
 
             if (DEBUG_FORWARDING) {
                 Log.d(TAG, "TCP response sent: $sourceIp:$sourcePort -> $destIp:$destPort " +
@@ -1241,20 +1349,10 @@ class SageService : VpnService() {
         destPort: Int,
         payload: ByteBuffer,
         payloadSize: Int,
-        outStream: FileOutputStream
+        outStream: FileOutputStream,
+        connectionState: TcpConnectionState
     ) {
-        // For IPv6, constructing proper packets is complex and requires careful implementation
-        // This is a simplified implementation
         try {
-            val connectionKey = "$destIp:$destPort-$sourceIp:$sourcePort"  // Reversed for response
-
-            // Get or create connection state
-            var connectionState = tcpConnectionStates[connectionKey]
-            if (connectionState == null) {
-                connectionState = TcpConnectionState(connectionKey)
-                tcpConnectionStates[connectionKey] = connectionState
-            }
-
             // IPv6 header (40 bytes fixed)
             val ipv6Header = ByteBuffer.allocate(40)
 
@@ -1281,17 +1379,17 @@ class SageService : VpnService() {
             tcpHeader.putShort(0, sourcePort.toShort())
             tcpHeader.putShort(2, destPort.toShort())
 
-            // Sequence number
+            // Sequence number - use tracked sequence number
             tcpHeader.putInt(4, connectionState.localSeqNum.toInt())
 
-            // ACK number
+            // ACK number - acknowledge all data received
             tcpHeader.putInt(8, connectionState.remoteSeqNum.toInt())
 
             // Data offset and flags
             tcpHeader.put(12, (5 shl 4).toByte())  // 5 words (20 bytes), no reserved bits
             tcpHeader.put(13, 0x18.toByte())  // PSH + ACK flags
 
-            // Window size
+            // Window size - use state value
             tcpHeader.putShort(14, connectionState.windowSize.toShort())
 
             // Checksum and urgent pointer
@@ -1315,9 +1413,6 @@ class SageService : VpnService() {
 
             // Write to VPN
             outStream.write(fullPacket.array(), 0, totalSize)
-
-            // Update sequence number
-            connectionState.localSeqNum += payloadSize
 
             if (DEBUG_FORWARDING) {
                 Log.d(TAG, "IPv6 TCP response sent: $sourceIp:$sourcePort -> $destIp:$destPort (${payloadSize} bytes)")
